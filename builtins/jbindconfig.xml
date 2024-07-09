@@ -1,0 +1,20 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<binding>
+    <groupId>org.jbind.bindings</groupId>
+    <artifactId>jbind-builtins</artifactId>
+    <version>1.0</version>    
+
+    <modules>
+        <module qualname="pandas" publicOnly="true" useConventions="true"/>
+    </modules>
+
+    <build targetDir="build" runMvn="true" javaVersion="21"/>
+    
+    <dependencies>
+        <dependency>
+            <groupId>org.jbind</groupId>
+            <artifactId>jbind-base</artifactId>
+            <version>1.0</version>
+        </dependency>
+    </dependencies>
+</binding>

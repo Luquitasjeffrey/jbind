@@ -1,0 +1,352 @@
+from abc import ABC, abstractmethod
+from dataclasses import dataclass
+import inspect
+from pathlib import Path
+from types import ModuleType
+from typing import Any, Iterable
+from os import getenv
+
+BASE_PACKAGE = getenv("BASE_PACKAGE", default="org.jbind.bindings")
+BASE_CLASS = "org.jbind.base.Binding"
+NATIVE_CONVERSIONS = {
+    object: "java.lang.Object",
+    str: "java.lang.String",
+    int: "int",
+    bool: "boolean",
+    float: "double",
+    type: "org.jbind.types.PythonType",
+    list: "org.jbind.builtins.List",
+    bytes: "byte[]",
+    Exception: "org.jbind.types.PythonExceptionWrapper",
+    None: "void"
+}
+
+def is_builtin(t: type):
+    return t in NATIVE_CONVERSIONS
+
+def is_inheritable(t: type):
+    return not t in {
+        bool, float, None, int, str, object, ABC
+    }
+
+def _convert_to_valid_identifier(identifier: str) -> str:
+    if identifier in {"interface", "abstract", "instanceof", "extends", "implements"}:
+        return identifier + "_"
+    else:
+        return identifier
+
+def get_package_name(module_name: str):
+    module_name_valid = ".".join(_convert_to_valid_identifier(identifier) for identifier in module_name.split("."))
+    return f"{BASE_PACKAGE}.{module_name_valid}"
+
+def get_type_qn(t: type):
+    if is_builtin(t):
+        return NATIVE_CONVERSIONS[t]
+    else:
+        return f"{get_package_name(t.__module__)}.{t.__name__}"
+
+def capitalize_first(s: str):
+    idx = 0
+    while s[idx] == "_": idx+=1
+    return s[0:idx] + s[idx].capitalize() + s[idx+1:]
+
+def globals_qual_class_name(module_name: str):
+    subpackages = module_name.split(".")
+    last = subpackages[-1]
+    namesp = ".".join(subpackages[:-1])
+    classname = capitalize_first(last)
+    return f"{BASE_PACKAGE}.{namesp}.{classname}".replace("..", ".")
+
+def unsnakify(snake_case: str):
+    try:
+        [first, *words] = (word for word in snake_case.split("_") if word)
+        ret = first + "".join(capitalize_first(word) for word in words if word)
+        if ret == snake_case:
+            ret = ""
+            for c in snake_case:
+                if c.isupper():
+                    ret += "_"
+                ret += c
+        return ret
+    except ValueError:
+        return "_"
+
+def is_ambiguous(f: "Function"):
+    if f.name == "close" and f.return_type != None:
+        return True
+    elif f.name == "_unwrap":
+        return True
+    return False
+    
+@dataclass(frozen=True)
+class Parameter:
+    name: str
+    type: type
+    is_keyword: bool = False
+
+    def bind(self, use_conventions = True):
+        name = unsnakify(self.name) if use_conventions else self.name
+        return f"{get_type_qn(self.type)} {name}"
+    
+    def bind_name(self, use_conventions = True):
+        return unsnakify(self.name) if use_conventions else self.name
+
+@dataclass
+class Function:
+    name: str
+    params: list[Parameter]
+    return_type: type
+
+    def __hash__(self) -> int:
+        return hash(self.name)
+    
+    def __eq__(self, other) -> bool:
+        return self.name == other.name
+
+    def bind(self, force_static = False, use_conventions = True, put_methodname_annotation = True, use_staticproxy = True):
+        is_static = self.is_static() or force_static
+        name = unsnakify(self.name) if use_conventions else self.name
+        if is_ambiguous(self):
+            name += "_"
+        if is_static:
+            params = ",".join(param.bind(use_conventions = use_conventions) for param in self.params)
+            if use_staticproxy:
+                retls = []
+                retls.append(f"    public static {get_type_qn(self.return_type)} {name}({params}){{")
+                retls.append(f"        {'return ' if self.return_type is not None else ''}_staticProxy.{name}({','.join(param.bind_name(use_conventions = use_conventions) for param in self.params)});")
+                
+                retls.append( "    }")
+                ret = "\n".join(retls)
+            else:
+                ret = f"    public static {get_type_qn(self.return_type)} {name}({params})"
+        else:
+            params = ",".join(param.bind(use_conventions = use_conventions) for param in self.params[1:])
+            ret = f"    {get_type_qn(self.return_type)} {name}({params})"
+        if put_methodname_annotation:
+            return f'    @org.jbind.annotation.PyMethodInfo(name="{self.name}")\n' + ret
+        else:
+            return ret
+
+    def is_instance(self):
+        return len(self.params) >= 1 and self.params[0].name == "self"
+    
+    def is_static(self):
+        return not self.is_instance()
+
+@dataclass
+class Class:
+    inherits: list[type]
+    name: str
+    methods: list[Function]
+    type_: type | None = None
+    instantiatable: bool = False
+    realname: str | None = None
+    has_metaclass: bool = False
+
+    def __post_init__(self):
+        method_map: dict[str, Function] = {}
+        for meth in self.methods:
+            if meth.name in method_map:
+                continue
+            method_map[meth.name] = meth
+        self.methods = list(method_map.values())
+
+    #ignore properties
+    def bind(self, module_qn: str | None = None, use_conventions=True, bind_public_only=True, force_static=False, is_public=True, force_instance=False) -> str:
+        
+        statics = lambda: (method for method in self.methods if (not force_instance) and (force_static or method.is_static()))
+        instances = lambda: (method for method in self.methods if force_instance or ((not force_static) and method.is_instance()))
+        ret = []
+        if module_qn:
+            ret.append(f"package {get_package_name(module_qn)};")
+        if staticproxy := self._build_staticproxy(statics(), module_qn, use_conventions=use_conventions, bind_public_only=bind_public_only):
+            ret.append(staticproxy)
+        
+        if not self.has_metaclass:
+            inheritted_classes = ",".join(get_type_qn(t) for t in self.inherits if is_inheritable(t))
+        else:
+            inheritted_classes = None
+        
+        if inheritted_classes:
+            inheritted_classes += f",{BASE_CLASS}"
+        else:
+            inheritted_classes = BASE_CLASS
+        
+        if module_qn:
+            ret.append(self._get_class_info_annotation(module_qn))
+        ret.append(f"{'public ' if is_public else ''}interface {self.name} extends {inheritted_classes} {{")
+        if staticproxy:
+            sp_name = self._get_staticproxy_name()
+            ret.append(f"    static {sp_name} _staticProxy = org.jbind.Binder.buildStaticProxy({sp_name}.class);")
+        if self.type_:
+            ret.append(self.newinstance_method(use_conventions))
+
+        for instance in set(instances()):
+            if bind_public_only and instance.name.startswith("_"):
+                continue
+            ret.append(f"{instance.bind(use_conventions = use_conventions)};")
+
+        
+        for static in set(statics()):
+            if bind_public_only and static.name.startswith("_"):
+                continue
+            ret.append(static.bind(force_static=True, use_conventions=use_conventions, put_methodname_annotation=False))
+
+        ret.append("}")
+        return "\n".join(ret)
+    
+    def _get_class_info_annotation(self, module_qn: str):
+        return f'@org.jbind.annotation.PyClassInfo(module="{module_qn}",className="{self.name}")'
+    
+    def _get_staticproxy_name(self):
+        return f"_{self.name}StaticProxy"
+
+    def _is_module(self):
+        return not self.type_
+    
+    def _build_staticproxy(self, staticmethods: Iterable[Function], module_qn: str,use_conventions=True, bind_public_only=True) -> str:
+        fake_instance = []
+        for s in staticmethods:
+            params = [Parameter("self", Any, False)]
+            params.extend(s.params)
+            fake_instance.append(Function(s.name, params, s.return_type))
+        static_proxy = Class([], self._get_staticproxy_name(), fake_instance)
+        if len(fake_instance)==0:
+            return None
+        ret = []
+        if self._is_module():
+            ret.append(f'@org.jbind.annotation.PyModuleInfo("{self.realname}")')
+        else:
+            ret.append(self._get_class_info_annotation(module_qn))
+        ret.append(static_proxy.bind(use_conventions=use_conventions, bind_public_only=bind_public_only, is_public=False))
+        return "\n".join(ret)
+
+    
+    def newinstance_method(self, use_conventions: bool):
+        init_method = Function("__init__", [Parameter("self", Any)], None)
+        for m in self.methods:
+            if m.name == "__init__":
+                init_method = m
+                break
+        newinstance = Function("new_instance", init_method.params[1:], self.type_)
+        signature = newinstance.bind(force_static=True, use_conventions=True, put_methodname_annotation=False, use_staticproxy=False)
+        parameters = ",".join(unsnakify(param.name) for param in newinstance.params)
+        if parameters:
+            parameters = "," + parameters
+        implementation = f"        return org.jbind.Binder.getNewInstance({self.name}.class{parameters});"
+        return "\n".join((signature + "{", implementation, "    }")
+                         )
+
+
+@dataclass
+class ModuleGlobals:
+    functions: list[Function]
+
+def get_module_functions(module: ModuleType) -> list[Function]:
+    functions = []
+    for _, obj in inspect.getmembers(module, inspect.isfunction):
+        functions.append(convert_function_signature(obj))
+
+    return functions
+
+def get_module_classes(module: ModuleType) -> list[Class]:
+    classes = []    
+    for name, cls in inspect.getmembers(module, inspect.isclass):
+        if cls.__module__ != module.__name__:
+            continue
+        #TODO: solve for __get__ and __set__ methods
+        try:
+            methods = []
+            for _, method_obj in inspect.getmembers(cls, inspect.isfunction):
+                methods.append(convert_function_signature(method_obj))
+            classes.append(Class(name=name, methods=methods, inherits=cls.__bases__, type_=cls, has_metaclass=cls.__class__!=type))
+        except:
+            pass
+    return classes
+
+def convert_function_signature(func):
+    sig = inspect.signature(func)
+    params: list[Parameter] = []
+
+    ignore_count = 0
+    for param in sig.parameters.values():
+        param_type = param.annotation if param.annotation != inspect.Parameter.empty else object
+        is_keyword = param.default != inspect.Parameter.empty
+        params.append(Parameter(name=param.name, type=param_type, is_keyword=is_keyword))
+
+    for param in params:
+        if not param.name.replace("_", ""):
+            ignore_count += 1
+            param.name = f"ignored{ignore_count}"
+
+    return_type = sig.return_annotation if sig.return_annotation != inspect.Signature.empty else object
+    return Function(name=func.__name__, params=params, return_type=return_type)
+
+class PrintWritter(ABC):
+    @abstractmethod
+    def println(self, text: str) -> None: ...
+
+    @abstractmethod
+    def cached(self) -> bool: ...
+
+    @abstractmethod
+    def close(self) -> None: ...
+
+class JavaFileManager(ABC):
+    @abstractmethod
+    def get_printwritter(self, class_name: str) -> PrintWritter: ...
+
+def bind_simplemodule(module: ModuleType, file_manager: JavaFileManager,use_conventions = True, bind_public_only = True, bind_globals = True):
+    module_name = module.__name__
+    for clazz in get_module_classes(module):
+        printwritter = file_manager.get_printwritter(get_type_qn(clazz.type_))
+        if not printwritter.cached():
+            print(module_name)
+            printwritter.println(clazz.bind(module_name, use_conventions=use_conventions,bind_public_only=bind_public_only))
+        printwritter.close()
+
+    if bind_globals:
+        global_decls_name = capitalize_first(module_name.split(".")[-1])
+        if global_decls_name == module_name.split(".")[-1]:
+            global_decls_name += "Globals"
+        global_decls_module_qualname = ".".join(module_name.split(".")[:-1])
+        global_decls = Class([], global_decls_name, [], realname=module_name)
+        print(f"{global_decls_module_qualname}.{global_decls_name}")
+        for func in get_module_functions(module):
+            global_decls.methods.append(func)
+        printwritter = file_manager.get_printwritter(BASE_PACKAGE + "." + global_decls_module_qualname + "." + global_decls_name)
+        printwritter.println(global_decls.bind(global_decls_module_qualname, use_conventions=use_conventions, bind_public_only=bind_public_only, force_static=True))
+        printwritter.close()
+
+def _iter_submodules(initfile: str):
+    dir = "/".join(initfile.split("/")[:-1])
+    for entry in Path(dir).iterdir():
+        filename = entry.name
+        if filename.startswith("__"):
+            continue
+        yield filename.replace(".py", "")
+
+def _import_submodule(submodule: ModuleType, module_qualname: str):
+    submodules = module_qualname.split(".")[1:]
+    ret = submodule
+    for submodule in submodules:
+        try:
+            ret = getattr(ret, submodule)
+        except AttributeError:
+            return None
+    return ret
+
+def bind_recursive(module: ModuleType, file_manager: JavaFileManager, use_conventions = True, bind_public_only = True):
+    #base case: file
+    if not module.__file__.endswith("__init__.py"):
+        bind_simplemodule(module, file_manager=file_manager, use_conventions=use_conventions, bind_public_only=bind_public_only)
+
+    #recursive case: module
+    for submodule_name in _iter_submodules(module.__file__):
+        submodule_qualname = module.__name__ + "." + submodule_name
+        try:
+            if submodule := _import_submodule(__import__(submodule_qualname), submodule_qualname):
+                bind_recursive(submodule, file_manager, use_conventions, bind_public_only)    
+        except ModuleNotFoundError:
+            pass
+
